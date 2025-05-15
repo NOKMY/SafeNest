@@ -1,7 +1,6 @@
-1. Inside of this folder "config". create 2 files and name it "firebase-config.json" and "firebase-credentials.json"
+1. Inside of this folder, create 2 files and name them "firebase-config.json" and "firebase-credentials.json".
 
-2. Inside of firebase-config.json
-(copy and paste these)
+2. Inside of firebase-config.json, copy & paste these.
 {
     "apiKey": "AIzaSyBLEljKRdr3TBOz4WKtoD-wr6U3SNQq9jI",
     "authDomain": "water-level-cf938.firebaseapp.com",
@@ -12,8 +11,7 @@
     "appId": "1:99109659503:web:74c87bbb7382f483163e9a"
 }
 
-3. Inside of firebase-credentials.json
-(copy and paste these)
+3. Inside of firebase-credentials.json, copy & paste these.
 {
   "type": "service_account",
   "project_id": "safenest-database",
