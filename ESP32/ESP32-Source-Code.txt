@@ -1,0 +1,681 @@
+#include <DNSServer.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <Arduino.h>
+#include <FirebaseESP32.h>
+#include <NTPClient.h>
+#include "addons/TokenHelper.h"
+#include <LiquidCrystal_I2C.h>
+
+WebServer server(80);  // Web server on port 80
+DNSServer dnsServer;
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+const IPAddress localIP(192, 168, 4, 1);
+const IPAddress gatewayIP(192, 168, 4, 1);
+const IPAddress subnetMask(255, 255, 255, 0);
+
+// Define pins and other constants
+const int greenLedPin = 15;
+const int yellowLedPin = 16;
+const int redLedPin = 17;
+const int triggerPin = 5;
+const int echoPin = 18;
+const float maxDistance = 400.0;
+const float calibrationOffset = 2.0;  // Offset to adjust the measurement
+const int numReadings = 20;           // Number of readings to average
+
+// Define sensor and container heights
+const float sensorHeight = 32.0;  // Height of the sensor from the ground (32 cm)
+float newSensorHeight = 0;
+bool newCalibration = false;
+const float containerHeight = 24.0;  // Container height (25 cm)
+
+// Define thresholds based on container height (in cm)
+float lowThreshold = 8.0;      // Low: 1-10 cm
+float mediumThreshold = 16.0;  // Medium: 10-18 cm
+float highThreshold = 21.0;    // High: 18-23 cm
+int readingID = 1;             // Initialize the reading counter to 1
+int maxReadings = 100;         // Set the maximum number of readings to store
+
+String lastIndicator = "";
+String lastDistance = "";
+
+#define API_KEY "AIzaSyBuAuIv_OqU7PPt3oRHLoWZGwRO9Uw6Nos"
+#define DATABASE_URL "https://safenest-database-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+const char* MANUAL_DATE = "";  // define dates
+
+// Define Firebase Data object
+FirebaseData fbdo;
+FirebaseJson json;
+FirebaseJson sensorDataJSON;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+bool signupOK = false;
+unsigned long sendDataPrevMillis = 0;
+
+// Structure to store WiFi credentials
+struct settings {
+  char ssid[30];
+  char password[30];
+};
+
+// Array to store multiple sets of WiFi credentials
+settings wifi_credentials[3];  // value to store the wifi credentials in an 2d Array
+int num_credentials = sizeof(wifi_credentials) / sizeof(wifi_credentials[0]);
+int current_credential = 0;  // Track current credential being tested
+
+// Timing variables for WiFi reconnection
+unsigned long disconnectStartTime = 0;          // Time when WiFi disconnection starts
+const unsigned long disconnectTimeout = 15000;  // 15 seconds to confirm disconnection
+
+bool wifiConnected = false;
+bool inCaptivePortalMode = false;  // Flag to track if in captive portal mode
+bool wasDisconnected = false;      // New flag to track disconnection state
+
+int stored_credentials_count = 0;  // Number of credentials currently stored
+
+int cycles = 0;
+
+// Function declarations
+void handlePortal();
+void saveCredentials();
+bool connectToWiFi();
+void startCaptivePortal();
+void monitorWiFiConnection();
+
+//-----------------------------
+void setup() {
+  // Setup pins
+  pinMode(greenLedPin, OUTPUT);
+  pinMode(yellowLedPin, OUTPUT);
+  pinMode(redLedPin, OUTPUT);
+  pinMode(triggerPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  // Initialize Serial Monitor for debugging
+  Serial.begin(115200);
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+
+  // Initialize EEPROM and read stored credentials
+  EEPROM.begin(sizeof(wifi_credentials) + sizeof(stored_credentials_count));
+  EEPROM.get(0, wifi_credentials);
+  EEPROM.get(sizeof(wifi_credentials), stored_credentials_count);
+
+  // Display message for WiFi configuration
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting...");
+  // Set WiFi to station mode and attempt to connect
+  WiFi.mode(WIFI_STA);
+  wifiConnected = connectToWiFi();
+
+  // Start the server for the captive portal
+  server.on("/", handlePortal);
+  server.on("/portal", handlePortal);
+  server.onNotFound(handleNotFound);
+  server.on("/reset", handleResetPage);
+  server.on("/doReset", resetWiFiCredentials);
+  server.on("/reboot", sysReboot);
+
+  server.begin();
+
+  // If no WiFi connection is established, start captive portal
+  if (!wifiConnected) {
+    startCaptivePortal();
+  } else {
+    configureFirebase();
+
+    // Use manual date if defined
+    if (strlen(MANUAL_DATE) > 0) {
+      Serial.println("✅ Using MANUAL_DATE: " + String(MANUAL_DATE));
+      setManualDate(MANUAL_DATE);  // ✅ Now it works correctly
+    } else {
+      Serial.println("🌐 Using NTP Time Sync...");
+      configTime(8 * 3600, 0, "time.google.com");  // Use NTP only if manual date is disabled
+    }
+  }
+}
+
+void sysReboot() {
+  server.send(200, "text/html", "System is rebooting....");
+  ESP.restart();
+}
+
+void configureFirebase() {
+  // Firebase initialization
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    lcd.print("Welcome to ");
+    lcd.setCursor(4, 1);
+    lcd.print("SafeNest");
+    signupOK = true;
+  }
+
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  if (Firebase.ready()) {
+    Serial.println("Firebase initialized successfully.");
+  } else {
+    Serial.println("Firebase failed to initialize: " + fbdo.errorReason());
+  }
+
+  if (Firebase.getJSON(fbdo, "/SensorConfig")) {
+    Serial.println("SensorConfig already exists, skipping initialization.");
+  } else {
+    Serial.println("Initializing SensorConfig...");
+    sensorDataJSON.set("SensorHeight", sensorHeight);
+    sensorDataJSON.set("Low", lowThreshold);
+    sensorDataJSON.set("Medium", mediumThreshold);
+    sensorDataJSON.set("High", highThreshold);
+    sensorDataJSON.set("Calibrated", newCalibration);
+
+    if (Firebase.set(fbdo, "/SensorConfig", sensorDataJSON)) {
+      Serial.println("Sensor configuration data saved successfully.");
+    } else {
+      Serial.println("Failed to save sensor configuration data: " + fbdo.errorReason());
+    }
+  }
+
+  delay(2000);
+}
+
+unsigned long lastSensorReadTime = 0;           // Variable to track the last sensor reading time
+const unsigned long sensorReadInterval = 5000;  // 5 seconds interval
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  // Continuously monitor WiFi connection status
+  monitorWiFiConnection();
+  unsigned long currentMillis = millis();
+
+  // Check if 5 seconds have passed since the last sensor reading
+  if (currentMillis - lastSensorReadTime >= sensorReadInterval && WiFi.status() == WL_CONNECTED) {
+    lastSensorReadTime = currentMillis;  // Update the time of the last sensor reading
+    handleSensor();                      // Perform the sensor reading
+  }
+}
+
+// Function to handle the captive portal web page
+void handlePortal() {
+  if (server.method() == HTTP_POST) {
+    // Get the submitted SSID and password
+    String ssid = server.arg("ssid");
+    String password = server.arg("password");
+
+    // Trim to avoid submitting whitespaces
+    ssid.trim();
+    password.trim();
+
+    // Validate the input: ensure SSID and password are not empty
+    if (ssid.length() == 0 || password.length() == 0) {
+      // Send an "Invalid input" message to the user
+      server.send(200, "text/html", "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>SafeNest - Captive Portal</title><style>*{box-sizing:border-box;}body{margin:0;font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans';font-size:1rem;font-weight:400;line-height:1.5;color:#212529;background-color:#f5f5f5;}.form-control{display:block;width:100%;height:calc(1.5em + .75rem + 2px);border:1px solid #ced4da;}.invalid-input{outline:2px solid red;}button{cursor:pointer;border:1px solid transparent;color:#fff;background-color:#007bff;border-color:#007bff;padding:.5rem 1rem;font-size:1.25rem;line-height:1.5;border-radius:.3rem;width:100%;}.form-signin{width:100%;max-width:400px;padding:15px;margin:auto;}h1{text-align:center;}p{text-align:center;color:red;}</style></head><body><main class='form-signin'><form action='/' method='post'><h1 class=''>Captive Portal</h1><br/><div class='form-floating'><label>SSID</label><input type='text' class='form-control invalid-input' name='ssid'></div><div class='form-floating'><br/><label>Password</label><input type='password' class='form-control invalid-input' name='password'></div><br/><br/><button type='submit'>Enter</button><p>Invalid Input: Please enter a valid SSID and Password.</p></form></main></body></html>");
+      return;  // Exit the function, no data is saved to EEPROM
+    }
+
+    // Save new credentials in the next available slot (overwrite if full)
+    int saveIndex = stored_credentials_count % num_credentials;  // Circular storage
+    strncpy(wifi_credentials[saveIndex].ssid, ssid.c_str(), sizeof(wifi_credentials[saveIndex].ssid) - 1);
+    strncpy(wifi_credentials[saveIndex].password, password.c_str(), sizeof(wifi_credentials[saveIndex].password) - 1);
+
+    // Ensure null termination
+    wifi_credentials[0].ssid[sizeof(wifi_credentials[0].ssid) - 1] = '\0';
+    wifi_credentials[0].password[sizeof(wifi_credentials[0].password) - 1] = '\0';
+
+
+    stored_credentials_count++;  // Update credential count
+
+    // Send a success message and restart the ESP32
+    server.send(200, "text/html", "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>SafeNest - Captive Portal</title><style>*,::after,::before{box-sizing:border-box;}body{margin:0;font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans';font-size:1rem;font-weight:400;line-height:1.5;color:#212529;background-color:#f5f5f5;}.form-control{display:block;width:100%;height:calc(1.5em + .75rem + 2px);border:1px solid #ced4da;}button{border:1px solid transparent;color:#fff;background-color:#007bff;border-color:#007bff;padding:.5rem 1rem;font-size:1.25rem;line-height:1.5;border-radius:.3rem;width:100%}.form-signin{width:100%;max-width:400px;padding:15px;margin:auto;}h1,p{text-align: center}</style> </head> <body><main class='form-signin'> <h1 style ='color:green;font-weight:bold;'>Success!</h1> <br/> <p>Wifi Credentials have been saved!<br />Restarting...</p></main></body></html>");
+    saveCredentials();  // save to EEPROM
+    delay(2000);
+    ESP.restart();
+  } else {
+    // Display the form for SSID and password input
+    server.send(200, "text/html", "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>SafeNest - Captive Portal</title> <style>*,::after,::before{box-sizing:border-box;}body{margin:0;font-family:'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans';font-size:1rem;font-weight:400;line-height:1.5;color:#212529;background-color:#f5f5f5;}.form-control{display:block;width:100%;height:calc(1.5em + .75rem + 2px);border:1px solid #ced4da;}button{cursor: pointer;border:1px solid transparent;color:#fff;background-color:#007bff;border-color:#007bff;padding:.5rem 1rem;font-size:1.25rem;line-height:1.5;border-radius:.3rem;width:100%}.form-signin{width:100%;max-width:400px;padding:15px;margin:auto;}h1{text-align: center}</style> </head> <body><main class='form-signin'> <form action='/' method='post'> <h1 class=''>Captive Portal</h1><br/><div class='form-floating'><label>SSID</label><input type='text' class='form-control' name='ssid'> </div><div class='form-floating'><br/><label>Password</label><input type='password' class='form-control' name='password'></div><br/><br/><button type='submit'>Enter</button></form></main> </body></html>");
+  }
+}
+
+//Redirect all unknown pages to Captive Portal
+void handleNotFound() {
+  server.sendHeader("Location", "/portal");
+  server.send(302, "text/plain", "Redirecting to Captive Portal");
+}
+
+String getCurrentTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return "";
+  }
+
+  char timeString[30];
+  strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  Serial.print("Current System Time: ");
+  Serial.println(timeString);  // ✅ This prints the detected system time
+
+  return String(timeString);
+}
+
+void setManualDate(String manualDate) {
+  struct tm timeinfo;
+
+  int year = manualDate.substring(0, 4).toInt();
+  int month = manualDate.substring(5, 7).toInt();
+  int day = manualDate.substring(8, 10).toInt();
+
+  timeinfo.tm_year = year - 1900;
+  timeinfo.tm_mon = month - 1;
+  timeinfo.tm_mday = day;
+  timeinfo.tm_hour = 0;
+  timeinfo.tm_min = 0;
+  timeinfo.tm_sec = 0;
+
+  time_t t = mktime(&timeinfo);
+  struct timeval now = { .tv_sec = t };
+  settimeofday(&now, NULL);
+
+  Serial.println("✅ Manual date set: " + manualDate);
+}
+
+
+// Function to attempt WiFi connection using stored credentials
+bool connectToWiFi() {
+  for (int i = 0; i < num_credentials; i++) {
+    Serial.print("Connecting to: ");
+    Serial.println(wifi_credentials[i].ssid);  // This would display the WiFi Network (SSID)
+    WiFi.begin(wifi_credentials[i].ssid, wifi_credentials[i].password);
+
+    byte tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries < 10) {
+      delay(1000);
+      Serial.print(".");
+      tries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println();
+      Serial.println("Connected successfully!");
+
+      server.on("/", blockPortal);
+      Serial.print("IP Address(Reset Page): ");
+      Serial.println(WiFi.localIP().toString() + "/reset");
+
+      //update LCD
+      // Display message for successful WiFi connection
+      lcd.clear();
+      lcd.setCursor(1, 0);
+      lcd.print("WiFi Connected");
+      lcd.setCursor(1, 1);
+      lcd.print(WiFi.localIP().toString());
+      delay(2000);
+      lcd.clear();
+      lcd.setCursor(3, 0);
+
+      return true;  // Successfully connected
+    }
+    Serial.println();
+    Serial.println("Failed to connect, trying next credentials");
+    Serial.println();
+
+    lcd.clear();
+    lcd.setCursor(1, 0);
+    lcd.print("Connection Failed!");
+    delay(1000);
+  }
+
+  Serial.println("All credentials failed to connect.");
+  return false;  // Failed to connect to any stored network
+}
+
+void blockPortal() {
+  server.send(200, "text/html", "You are already connected! To reset, press the reset button or disable the existing SSID where this module is connected.");
+}
+
+// Function to start captive portal in AP mode
+void startCaptivePortal() {
+  if (!inCaptivePortalMode) {
+    WiFi.mode(WIFI_AP);  // This would start an Access Point
+    WiFi.softAPConfig(localIP, gatewayIP, subnetMask);
+    WiFi.softAP("SafeNest Captive Portal");
+
+    IPAddress apIP = WiFi.softAPIP();
+
+    Serial.print("Access Point started. Connect to the network 'SafeNest Captive Portal' and open http://");
+    Serial.println(apIP);
+    dnsServer.start(53, "*", apIP);
+    inCaptivePortalMode = true;
+  }
+}
+
+// Save WiFi credentials in EEPROM
+void saveCredentials() {
+  EEPROM.put(0, wifi_credentials);
+  EEPROM.put(sizeof(wifi_credentials), stored_credentials_count);
+  EEPROM.commit();
+  Serial.println("WiFi credentials saved.");
+}
+
+// Function to monitor WiFi connection status and start captive portal if needed
+void monitorWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED && !inCaptivePortalMode) {
+    if (disconnectStartTime == 0) {
+      disconnectStartTime = millis();  // Start disconnection timer
+      Serial.println("WiFi disconnected, reconnecting...");
+      Serial.println();
+      wasDisconnected = true;  // Mark as disconnected
+    }
+
+    // If disconnected for more than the timeout duration, start AP mode
+    if (millis() - disconnectStartTime > disconnectTimeout) {
+      Serial.println("WiFi connection failed after timeout. Starting captive portal.");
+      Serial.println();
+      startCaptivePortal();
+    }
+  } else if (WiFi.status() == WL_CONNECTED) {
+    // Check if the connection is just restored
+    if (wasDisconnected) {
+      Serial.println("Connection is restored");
+      wasDisconnected = false;  // Reset the flag to avoid printing again
+    }
+    disconnectStartTime = 0;  // Reset the disconnection timer
+    inCaptivePortalMode = false;
+  }
+}
+
+void handleResetPage() {
+  // Display a page with a reset button
+  server.send(200, "text/html", "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>SafeNest - Captive Portal Reset</title><style>body{font-family:Arial,sans-serif;background-color:#f5f5f5;text-align:center;padding-top:50px;}button{border:none;background-color:red;color:white;padding:10px 20px;font-size:18px;border-radius:5px;cursor:pointer;}</style></head><body><h1>Captive Portal</h1><br/><br/><button onclick='location.href=\"/doReset\"'>Reset</button></body></html>");
+}
+
+void resetWiFiCredentials() {
+  // Reset both the credentials and count structure to default (0)
+  memset(wifi_credentials, 0, sizeof(wifi_credentials));  // Clear the credential array
+  stored_credentials_count = 0;                           // Reset the count to 0
+
+  // Save the empty state to EEPROM
+  EEPROM.put(0, wifi_credentials);
+  EEPROM.put(sizeof(wifi_credentials), stored_credentials_count);
+  EEPROM.commit();
+
+  Serial.println("EEPROM reset done.");
+  server.send(200, "text/html", "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>SafeNest - Captive Portal Reset</title><style>body{font-family:Arial,sans-serif;background-color:#f5f5f5;text-align:center;padding-top:50px;}button{border:none;background-color:red;color:white;padding:10px 20px;font-size:18px;border-radius:5px;cursor:pointer;}</style></head><body><h1>WiFi Credentials Reset!</h1><p>The device will restart in a moment...</p></body></html>");
+
+  delay(2000);
+  ESP.restart();  // Restart after reset
+}
+
+//==========================================================================
+//PROXIMITY SENSOR CODE
+
+void retrieveToFirebase() {
+
+  if (Firebase.getFloat(fbdo, "/SensorConfig/SensorHeight")) {
+    newSensorHeight = fbdo.floatData();
+    Serial.print("Current Sensor Height: " + String(sensorHeight));
+    Serial.println();
+    Serial.print("Updated Sensor Height: " + String(newSensorHeight));
+    Serial.println();
+    Serial.println("=================================================");
+  }
+  if (Firebase.getBool(fbdo, "/SensorConfig/Calibrated")) {
+    newCalibration = fbdo.boolData();
+  }
+
+  if (Firebase.getFloat(fbdo, "SensorConfig/Low")) {
+    lowThreshold = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, "SensorConfig/Medium")) {
+    mediumThreshold = fbdo.floatData();
+  }
+  if (Firebase.getFloat(fbdo, "SensorConfig/High")) {
+    highThreshold = fbdo.floatData();
+  }
+  delay(1000);
+}
+
+void handleSensor() {
+  Serial.println("HANDLING SENSOR DATA...");
+  // Get accurate distance from the ultrasonic sensor
+  float distanceInCm = getUltrasonicDistanceInCm() + calibrationOffset;
+
+  float waterLevel = 0.0;
+
+  // Calculate water level using Y = C - R
+  if (newCalibration) {
+    waterLevel = newSensorHeight - distanceInCm;
+    Serial.println("✅ Using NEW sensor height: " + String(newSensorHeight));
+  } else {
+    waterLevel = sensorHeight - distanceInCm;
+    Serial.println("❌ Using OLD sensor height: " + String(sensorHeight));
+  }
+
+
+
+
+  // Ensure water level is not negative and does not exceed the container height
+  if (waterLevel < 0) {
+    waterLevel = 0;
+  }
+  if (waterLevel > containerHeight) {
+    waterLevel = containerHeight;  // Cap water level to container height
+  }
+
+  // Determine water level indicator based on actual water level
+  String indicator = "Indicator:";
+  bool isLow = waterLevel > 0 && waterLevel <= lowThreshold;                   // Low: 1-8 cm
+  bool isMedium = waterLevel > lowThreshold && waterLevel <= mediumThreshold;  // Medium: 8-16 cm
+  bool isHigh = waterLevel > mediumThreshold && waterLevel <= highThreshold;   // High: 16-21 cm
+  bool overflow = waterLevel > highThreshold;
+  // Update LED states based on water levels
+  if (overflow) {
+    indicator = "Overflow!    ";  // Overflow indicator
+    blinkLed(greenLedPin, 500);
+    delay(1000);
+    blinkLed(yellowLedPin, 500);
+    delay(1000);
+    blinkLed(redLedPin, 500);
+    delay(1000);
+  } else if (isHigh) {
+    blinkLed(redLedPin, 500);  // Blink red LED every 0.5 seconds
+    indicator += "HIGH   ";
+  } else if (isMedium) {
+    blinkLed(yellowLedPin, 1000);  // Blink yellow LED every 1 second
+    indicator += "MEDIUM ";
+  } else if (isLow) {
+    blinkLed(greenLedPin, 1500);  // Blink green LED every 1.5 seconds
+    indicator += "LOW    ";
+  } else {
+    digitalWrite(greenLedPin, LOW);
+    digitalWrite(yellowLedPin, LOW);
+    digitalWrite(redLedPin, LOW);
+    indicator += "NONE   ";
+  }
+
+  // Prepare display for water level in cm (for Firebase/dashboard)
+  String waterLevelDisplay = String(waterLevel) + " cm";
+
+  // Store data to Firebase (in cm)
+  storeToFirebase(isLow, isMedium, isHigh, overflow, waterLevelDisplay);
+  retrieveToFirebase();
+  Serial.println("LEVEL VARIABLE: " + waterLevelDisplay);
+
+  // Update the LCD display with raw distance
+  updateLCD(indicator, distanceInCm);
+
+  delay(500);  // Delay before the next sensor reading
+}
+
+// Function to get ultrasonic distance in cm with averaging
+float getUltrasonicDistanceInCm() {
+  float readings[numReadings];  // Array to hold the readings
+  float totalDistance = 0;
+  int validReadings = 0;  // Counter for valid readings
+
+  for (int i = 0; i < numReadings; i++) {
+    digitalWrite(triggerPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(triggerPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(triggerPin, LOW);
+
+    long duration = pulseIn(echoPin, HIGH);
+    if (duration > 0) {
+      float distanceInCm = (duration * 0.0343) / 2;  // Convert duration to distance
+      if (distanceInCm <= maxDistance) {
+        readings[i] = distanceInCm;  // Store the reading
+        validReadings++;             // Count valid readings
+      }
+    }
+    delay(50);  // Delay between readings
+  }
+
+  // Calculate the average of valid readings
+  for (int i = 0; i < numReadings; i++) {
+    if (readings[i] > 0) {  // Only average valid readings
+      totalDistance += readings[i];
+    }
+  }
+
+  return (validReadings > 0) ? (totalDistance / validReadings) : 0;  // Return the average distance
+}
+
+// Function to blink an LED with a specific interval
+void blinkLed(int ledPin, int interval) {
+  digitalWrite(ledPin, HIGH);  // Turn on the LED
+  delay(interval / 2);         // Wait for half of the interval
+  digitalWrite(ledPin, LOW);   // Turn off the LED
+  delay(interval / 2);         // Wait for the other half of the interval
+}
+
+// Function to update LCD with the raw distance
+void updateLCD(String indicator, float rawDistance) {
+  if (indicator != lastIndicator) {
+    lcd.setCursor(0, 0);
+    lcd.print(indicator);
+    lastIndicator = indicator;
+  }
+
+  if (String(rawDistance) != lastDistance) {
+    lcd.setCursor(0, 1);
+    lcd.print("Distance: ");
+    lcd.print(rawDistance, 1);  // Display the raw distance on the LCD
+    lastDistance = String(rawDistance);
+  }
+}
+
+
+void storeToFirebase(bool low, bool medium, bool high, bool overflow, String waterLevel) {
+#ifdef MANUAL_DATE
+  String date = MANUAL_DATE;  // ✅ Uses predefined manual date
+#else
+  String timestamp = getCurrentTime();
+  if (timestamp == "") {
+    Serial.println("❌ Failed to get timestamp");
+    return;
+  }
+  String date = timestamp.substring(0, 10);  // Extract YYYY-MM-DD
+#endif
+
+  String time = timestamp.substring(11, 19);
+  String hour = time.substring(0, 2);     // Extract HH for hourly grouping
+  String dateTime = date + " : " + time;  // ✅ Declare `dateTime` here
+
+  // ✅ Initialize reading count to 1 by default
+  int readingCount = 1;
+
+  if (Firebase.getInt(fbdo, "/DailyRecords/" + date + "/ReadingCount")) {
+    if (fbdo.dataType() == "int") {
+      readingCount = fbdo.intData() + 1;  // ✅ Increment if exists
+    }
+  }
+
+  // ✅ Format the reading ID as "Reading_001", "Reading_002", etc.
+  char buffer[15];
+  sprintf(buffer, "Reading_%03d", readingCount);
+  String readingID = String(buffer);
+
+  // ✅ Prepare JSON for WaterLevel
+  FirebaseJson waterLevelJson;
+  waterLevelJson.set("Distance", waterLevel);
+  waterLevelJson.set("Time", time);
+  waterLevelJson.set("Date", date);
+
+  if (Firebase.ready() && signupOK) {
+    if (Firebase.setBool(fbdo, "/WaterIndicator/Low", low) && Firebase.setBool(fbdo, "/WaterIndicator/Medium", medium) && Firebase.setBool(fbdo, "/WaterIndicator/High", high) && Firebase.setBool(fbdo, "/WaterIndicator/Overflow", overflow)) {
+
+      Serial.println("✅ Water indicator data written successfully.");
+
+      // ✅ Store the new reading inside the correct date
+      if (Firebase.set(fbdo, "/DailyRecords/" + date + "/" + readingID, waterLevelJson)) {
+        Serial.println("✅ Data saved successfully as " + readingID);
+      } else {
+        Serial.println("❌ Error saving data: " + fbdo.errorReason());
+      }
+
+      // ✅ Override WaterLevel with Distance, Time, and Date
+      if (Firebase.set(fbdo, "/WaterLevel", waterLevelJson)) {
+        Serial.println("✅ WaterLevel updated successfully.");
+      } else {
+        Serial.println("❌ Failed to update WaterLevel: " + fbdo.errorReason());
+      }
+
+      // ✅ Update the ReadingCount for the current day
+      if (Firebase.setInt(fbdo, "/DailyRecords/" + date + "/ReadingCount", readingCount)) {
+        Serial.println("✅ ReadingCount updated for " + date + ": " + String(readingCount));
+      } else {
+        Serial.println("❌ Failed to update ReadingCount: " + fbdo.errorReason());
+      }
+
+      // --- ✅ NEW: PAST24HOURS IMPLEMENTATION ---
+      // ✅ Store readings under /Past24Hours/{YYYY-MM-DD}/Hour_{HH}/Reading_XXX
+      String pastHourPath = "/Past24Hours/" + date + "/Hour_" + hour + "/" + readingID;
+
+      if (Firebase.set(fbdo, pastHourPath, waterLevelJson)) {
+        Serial.println("✅ Past24Hours entry saved successfully in " + pastHourPath);
+      } else {
+        Serial.println("❌ Failed to save Past24Hours entry: " + fbdo.errorReason());
+      }
+
+      // --- ✅ SENSOR STATUS MANAGEMENT (LIMITED TO 5 RECORDS) ---
+      int sensorCount = 0;
+      if (Firebase.getInt(fbdo, "/SensorStatus/" + date + "/Count")) {
+        if (fbdo.dataType() == "int") {
+          sensorCount = fbdo.intData();  // ✅ Get current count
+        }
+      }
+
+      // ✅ Increment count and reset to 1 if it exceeds 5 (circular buffer)
+      sensorCount = (sensorCount % 5) + 1;
+
+      // ✅ Use `dateTime` now
+      if (Firebase.setString(fbdo, "/SensorStatus/" + date + "/Entry_" + String(sensorCount), dateTime)) {
+        Serial.println("✅ SensorStatus updated successfully at Entry_" + String(sensorCount));
+      } else {
+        Serial.println("❌ Failed to update SensorStatus: " + fbdo.errorReason());
+      }
+
+      // ✅ Update the Count tracker
+      if (Firebase.setInt(fbdo, "/SensorStatus/" + date + "/Count", sensorCount)) {
+        Serial.println("✅ SensorStatus Count updated to: " + String(sensorCount));
+      } else {
+        Serial.println("❌ Failed to update SensorStatus Count: " + fbdo.errorReason());
+      }
+
+    } else {
+      Serial.println("❌ Failed to write water indicator.");
+    }
+
+  } else {
+    Serial.println("❌ Firebase not ready or signup failed.");
+  }
+}
